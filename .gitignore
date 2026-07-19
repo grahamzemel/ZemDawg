@@ -1,6 +1,8 @@
 logs/
 bridge.state.json
 bridge.sent_watermark
+reminders.json
+notes.json
 *.pyc
 __pycache__/
 .DS_Store

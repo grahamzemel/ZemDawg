@@ -23,6 +23,7 @@ import imessage
 DB_PATH = Path.home() / "Library/Messages/chat.db"
 STATE_FILE = Path(__file__).with_suffix(".state.json")
 REMINDERS_FILE = Path(__file__).with_name("reminders.json")
+NOTES_FILE = Path(__file__).with_name("notes.json")
 LOG_DIR = Path(__file__).parent / "logs"
 REPO_ROOT = Path(__file__).resolve().parent
 MIGRATE_SCRIPT = REPO_ROOT / "migrate.py"
@@ -652,18 +653,38 @@ def _call_claude(user_text, system_prompt, timeout=90):
 
 
 _CLASSIFY_PROMPT = (
-    "Classify the following message into exactly one of four categories. "
+    "Classify the following message into exactly one of five categories. "
     "Reply with exactly one word.\n"
-    "command — the user wants to run a bridge operation: check usage/status/credits, "
-    "get the current session URL, update/restart the bridge, start a new/fresh session, "
-    "stop/clear the session, list reminders, or cancel a reminder.\n"
-    "reminder — the user wants to be reminded of something at a future time or after a delay.\n"
-    "coding — the message requires code to be written, debugged, deployed, or references "
-    "a specific repo, PR, or technical implementation task.\n"
+    "command — bridge operations: check status/credits/usage, get URL, update/restart bridge, "
+    "start new session, list or cancel reminders, list or delete notes.\n"
+    "reminder — user wants to be reminded of something at a specific future time or after a delay.\n"
+    "note — user wants to save, jot down, write down, find, view, edit, rename, append to, "
+    "or delete a note. Keywords: jot, write this down, remember this, save this, note, "
+    "show my notes, find my note, open note.\n"
+    "coding — requires code to be written, debugged, deployed, or references a specific repo or PR.\n"
     "general — everything else: questions, ideas, planning, conversation.\n"
-    "If uncertain between command and general, reply general. "
-    "If uncertain between coding and general, reply general. "
-    "If the message contains a time (at 6pm, in 2 hours, tomorrow morning) AND something to remember, reply reminder."
+    "Priority: if it has a future time AND content to save, prefer reminder over note. "
+    "If it references saving info without a specific fire time, prefer note. "
+    "If uncertain between coding and general, reply general."
+)
+
+_NOTE_OP_PROMPT = (
+    "The user wants to do something with their notes. Determine the operation and extract parameters.\n"
+    "Operations: create, list, show, search, rename, append, delete\n"
+    "  create — save new information (jot, write down, note, remember, save)\n"
+    "  list — see all notes\n"
+    "  show — read a specific note by number or keyword\n"
+    "  search — find notes about a topic\n"
+    "  rename — change a note title\n"
+    "  append — add more content to an existing note\n"
+    "  delete — remove a note\n\n"
+    "Reply in EXACTLY this format (fill in none if not applicable):\n"
+    "OP: create\n"
+    "INDEX: none\n"
+    "QUERY: none\n"
+    "NEW_TITLE: none\n"
+    "TITLE: Short 3-6 word title for the note\n"
+    "CONTENT: Full verbatim content to save\n"
 )
 
 _COMMAND_EXTRACT_PROMPT = (
@@ -717,6 +738,11 @@ def route_message(config, text, sender, state, *, blocking=False):
     # Reminder intent — extract time + content and schedule it.
     if classification and "reminder" in classification.lower():
         threading.Thread(target=_set_reminder, args=(config, text, sender), daemon=True).start()
+        return
+
+    # Note intent — create/view/edit/search notes.
+    if classification and "note" in classification.lower():
+        threading.Thread(target=_handle_note_intent, args=(text, sender), daemon=True).start()
         return
 
     is_coding = classification is not None and "coding" in classification.lower()
@@ -931,6 +957,171 @@ def _cancel_reminder(text, sender):
     send_reply(sender, "Could not find that reminder. Say 'reminders' to see the list.")
 
 
+def _load_notes():
+    try:
+        if NOTES_FILE.exists():
+            return json.loads(NOTES_FILE.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _save_notes(notes):
+    try:
+        NOTES_FILE.write_text(json.dumps(notes, indent=2))
+    except Exception as e:
+        LOG.error("Failed to save notes: %s", e)
+
+
+def _notes_sorted(notes):
+    return sorted(notes, key=lambda n: n.get("modified_at", 0), reverse=True)
+
+
+def _format_note_time(ts):
+    from datetime import datetime
+    return datetime.fromtimestamp(ts).strftime("%b %-d at %-I:%M %p")
+
+
+def _handle_note_intent(text, sender):
+    """Use Claude to parse the note operation, then execute it."""
+    raw = _call_claude(text, _NOTE_OP_PROMPT, timeout=60)
+    if not raw:
+        send_reply(sender, "Could not understand that note request. Try: 'jot this down: ...' or 'show my notes'")
+        return
+
+    params = {}
+    current_key = None
+    current_val_lines = []
+    for line in raw.splitlines():
+        for key in ("OP", "INDEX", "QUERY", "NEW_TITLE", "TITLE", "CONTENT"):
+            if line.startswith(f"{key}:"):
+                if current_key:
+                    params[current_key] = "\n".join(current_val_lines).strip()
+                current_key = key
+                current_val_lines = [line[len(key)+1:].strip()]
+                break
+        else:
+            if current_key:
+                current_val_lines.append(line)
+    if current_key:
+        params[current_key] = "\n".join(current_val_lines).strip()
+
+    op = params.get("OP", "list").lower()
+    index_raw = params.get("INDEX", "none").strip()
+    index = None
+    if index_raw.isdigit():
+        index = int(index_raw) - 1  # 1-based → 0-based
+    query = params.get("QUERY", "none").strip()
+    if query.lower() == "none":
+        query = ""
+    new_title = params.get("NEW_TITLE", "none").strip()
+    if new_title.lower() == "none":
+        new_title = ""
+    title = params.get("TITLE", "").strip() or "Untitled"
+    content = params.get("CONTENT", "").strip()
+
+    notes = _load_notes()
+    now = time.time()
+
+    if op == "create":
+        if not content:
+            send_reply(sender, "Could not find content to save. Try: 'jot this down: [your note]'")
+            return
+        note = {
+            "id": str(int(now * 1000)),
+            "title": title,
+            "content": content,
+            "created_at": now,
+            "modified_at": now,
+        }
+        notes.append(note)
+        _save_notes(notes)
+        send_reply(sender, f"Saved: {title}")
+
+    elif op == "list":
+        _list_notes(sender, notes)
+
+    elif op == "show":
+        sorted_notes = _notes_sorted(notes)
+        if index is not None and 0 <= index < len(sorted_notes):
+            n = sorted_notes[index]
+            send_reply(sender, f"{n['title']}\n({_format_note_time(n['modified_at'])})\n\n{n['content']}")
+        elif query:
+            matches = [n for n in sorted_notes if query.lower() in n["title"].lower() or query.lower() in n["content"].lower()]
+            if matches:
+                n = matches[0]
+                send_reply(sender, f"{n['title']}\n({_format_note_time(n['modified_at'])})\n\n{n['content']}")
+            else:
+                send_reply(sender, f"No note found matching '{query}'.")
+        else:
+            send_reply(sender, "Say which note: 'show note 2' or 'show my note about X'")
+
+    elif op == "search":
+        sorted_notes = _notes_sorted(notes)
+        q = query or content
+        matches = [n for n in sorted_notes if q.lower() in n["title"].lower() or q.lower() in n["content"].lower()]
+        if not matches:
+            send_reply(sender, f"No notes found matching '{q}'.")
+            return
+        lines = [f"Found {len(matches)} note(s) matching '{q}':"]
+        for i, n in enumerate(matches, 1):
+            lines.append(f"{i}. {n['title']} — {_format_note_time(n['modified_at'])}")
+        send_reply(sender, "\n".join(lines))
+
+    elif op == "rename":
+        sorted_notes = _notes_sorted(notes)
+        if index is not None and 0 <= index < len(sorted_notes):
+            target = sorted_notes[index]
+            old_title = target["title"]
+            for n in notes:
+                if n["id"] == target["id"]:
+                    n["title"] = new_title or title
+                    n["modified_at"] = now
+            _save_notes(notes)
+            send_reply(sender, f"Renamed '{old_title}' to '{new_title or title}'")
+        else:
+            send_reply(sender, "Say which note to rename: 'rename note 2 to New Title'")
+
+    elif op == "append":
+        sorted_notes = _notes_sorted(notes)
+        if index is not None and 0 <= index < len(sorted_notes):
+            target = sorted_notes[index]
+            for n in notes:
+                if n["id"] == target["id"]:
+                    n["content"] = n["content"].rstrip() + "\n\n" + content
+                    n["modified_at"] = now
+            _save_notes(notes)
+            send_reply(sender, f"Added to '{target['title']}'")
+        else:
+            send_reply(sender, "Say which note to add to: 'add to note 2: ...'")
+
+    elif op == "delete":
+        sorted_notes = _notes_sorted(notes)
+        if index is not None and 0 <= index < len(sorted_notes):
+            target = sorted_notes[index]
+            notes = [n for n in notes if n["id"] != target["id"]]
+            _save_notes(notes)
+            send_reply(sender, f"Deleted: {target['title']}")
+        else:
+            send_reply(sender, "Say which note to delete: 'delete note 2'")
+
+    else:
+        _list_notes(sender, notes)
+
+
+def _list_notes(sender, notes=None):
+    if notes is None:
+        notes = _load_notes()
+    sorted_notes = _notes_sorted(notes)
+    if not sorted_notes:
+        send_reply(sender, "No notes yet. Try: 'jot this down: ...'")
+        return
+    lines = [f"Notes ({len(sorted_notes)} total):"]
+    for i, n in enumerate(sorted_notes, 1):
+        lines.append(f"{i}. {n['title']} — {_format_note_time(n['modified_at'])}")
+    send_reply(sender, "\n".join(lines))
+
+
 def _build_status(config, state, sender):
     """Return a plain-text status string showing what the bridge is doing right now."""
     lines = ["ZemDawg Status"]
@@ -1073,8 +1264,16 @@ def handle_command(config, text, sender, state, *, blocking=False):
         _list_reminders(sender)
         return True
 
-    if lower.startswith("cancel reminder") or lower.startswith("cancel reminder"):
+    if lower.startswith("cancel reminder"):
         _cancel_reminder(t, sender)
+        return True
+
+    if lower in ("notes", "my notes", "list notes", "show notes"):
+        _list_notes(sender)
+        return True
+
+    if re.match(r"^(note|show note|open note|delete note|rename note)\s*\d", lower):
+        threading.Thread(target=_handle_note_intent, args=(t, sender), daemon=True).start()
         return True
 
     return False

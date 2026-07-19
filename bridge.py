@@ -783,6 +783,80 @@ def run_migration(command_text, sender):
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _build_status(config, state, sender):
+    """Return a plain-text status string showing what the bridge is doing right now."""
+    lines = ["ZemDawg Status"]
+
+    # --- Active session ---
+    active = _get_active_session(state, sender)
+    if active:
+        session_id = active.get("session_id", "")
+        url = active.get("url", "")
+        lines.append("")
+        lines.append("Active Devin session")
+        if url:
+            lines.append(f"Devin Instance: {url}")
+        # Fetch live session status from Devin API
+        try:
+            data = poll_devin_session(config, session_id)
+            detail = data.get("status_detail") or data.get("status") or "unknown"
+            status_enum = data.get("status_enum") or ""
+            lines.append(f"Session status: {detail}")
+            # Show what Devin last said
+            items = fetch_devin_messages(config, session_id)
+            devin_items = [i for i in items if i.get("source") == "devin" and i.get("message")]
+            if devin_items:
+                last_msg = devin_items[-1]["message"]
+                preview = last_msg[:200] + ("..." if len(last_msg) > 200 else "")
+                lines.append(f"Last from Devin: {preview}")
+            user_items = [i for i in items if i.get("source") == "user" and i.get("message")]
+            if user_items:
+                last_user = user_items[-1]["message"]
+                preview = last_user[:120] + ("..." if len(last_user) > 120 else "")
+                lines.append(f"Last from you: {preview}")
+        except Exception as e:
+            lines.append(f"Could not fetch session details: {e}")
+    else:
+        lines.append("")
+        credits_ok, credits_reason = devin_usage.devin_credits_ok()
+        if credits_ok:
+            lines.append("Mode: Claude router (no active Devin session)")
+            lines.append("Send a coding task to start a Devin session.")
+        else:
+            lines.append("Mode: Claude only (Devin unavailable)")
+            lines.append(f"Reason: {credits_reason}")
+        lines.append("Claude: claude-sonnet-4-6 via Pro plan, running locally")
+
+    # --- Devin limits ---
+    lines.append("")
+    lines.append("Devin limits")
+    try:
+        usage = devin_usage.build_usage_status()
+        daily_s = usage.get("daily_sessions")
+        daily_l = usage.get("daily_limit")
+        weekly_s = usage.get("weekly_sessions")
+        weekly_l = usage.get("weekly_limit")
+        total_acus = usage.get("total_acus")
+        quota = usage.get("quota")
+
+        if daily_l is not None:
+            used = int(daily_s) if daily_s is not None else "?"
+            lines.append(f"Today: {used}/{int(daily_l)} sessions")
+        if weekly_l is not None:
+            used = int(weekly_s) if weekly_s is not None else "?"
+            lines.append(f"This week: {used}/{int(weekly_l)} sessions")
+        if quota is not None and total_acus is not None:
+            lines.append(f"Monthly ACUs: {total_acus:.0f}/{quota:.0f}")
+        if daily_l is None and weekly_l is None and quota is None:
+            lines.append("No limits configured.")
+        if usage.get("error"):
+            lines.append(f"Note: {usage['error'][:120]}")
+    except Exception as e:
+        lines.append(f"Could not fetch Devin usage: {e}")
+
+    return "\n".join(lines)
+
+
 def handle_command(config, text, sender, state, *, blocking=False):
     t = text.strip()
     lower = t.lower()
@@ -806,8 +880,7 @@ def handle_command(config, text, sender, state, *, blocking=False):
         return True
 
     if lower == "status":
-        status = devin_usage.build_usage_status()
-        send_reply(sender, devin_usage.format_status(status))
+        send_reply(sender, _build_status(config, state, sender))
         return True
 
     if lower.startswith("estimate "):
@@ -837,7 +910,11 @@ def handle_command(config, text, sender, state, *, blocking=False):
         if active:
             send_reply(sender, f"Devin Instance: {active['url']}")
         else:
-            send_reply(sender, "No active session.")
+            credits_ok, _ = devin_usage.devin_credits_ok()
+            if credits_ok:
+                send_reply(sender, "No active Devin session. Send a coding task to start one.")
+            else:
+                send_reply(sender, "No active Devin session. Claude is handling your messages directly — no session link.")
         return True
 
     if lower in ("update", "deploy", "pull"):

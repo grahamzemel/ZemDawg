@@ -1137,9 +1137,18 @@ def _list_notes(sender, notes=None):
     _ctx_set(sender, "notes_list", items=sorted_notes)
 
 
-def _show_note(sender, note):
-    """Send a note's full content and set context so follow-ups work."""
-    send_reply(sender, f"{note['title']}\n({_format_note_time(note['modified_at'])})\n\n{note['content']}")
+_NOTE_PREVIEW_LIMIT = 1200
+
+
+def _show_note(sender, note, full=False):
+    """Send a note. Shows a preview by default; set full=True for the whole thing."""
+    content = note["content"]
+    header = f"{note['title']}\n({_format_note_time(note['modified_at'])})\n\n"
+    if full or len(header + content) <= _NOTE_PREVIEW_LIMIT:
+        send_reply(sender, header + content)
+    else:
+        preview = content[:_NOTE_PREVIEW_LIMIT - len(header)]
+        send_reply(sender, header + preview + "\n\n[truncated — say 'full' to see the rest]")
     _ctx_set(sender, "note_open", item=note)
 
 
@@ -1180,9 +1189,12 @@ def _try_context_shortcut(text, sender, state, config, blocking):
                 _show_note(sender, items[idx])
                 return True
 
-    # After showing a single note: "delete it", "delete this", "rename it to X", "add: ...", "close"
+    # After showing a single note: "full", "delete it", "rename it to X", "add: ..."
     if ctx_type == "note_open":
         item = ctx.get("item", {})
+        if lower.strip() in ("full", "full note", "show full", "see full", "show all", "all", "more", "see more", "show more"):
+            _show_note(sender, item, full=True)
+            return True
         if re.match(r"^(delete\s+(it|this|that)|remove\s+(it|this))$", lower):
             notes = _load_notes()
             notes = [n for n in notes if n["id"] != item["id"]]

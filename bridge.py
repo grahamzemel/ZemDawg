@@ -46,6 +46,22 @@ MAX_MESSAGE_AGE = float(os.environ.get("MAX_MESSAGE_AGE_SECONDS", "3600"))
 LOG = logging.getLogger("devin_bridge")
 STATE_LOCK = threading.Lock()
 
+# Per-sender conversational context so follow-up messages like "open 1" or
+# "delete it" work after showing a list or a note.
+# Shape: { norm_sender: {"type": "notes_list"|"note_open"|"reminders_list", "items": [...], "item": {...}} }
+_ctx: dict = {}
+_ctx_lock = threading.Lock()
+
+
+def _ctx_set(sender, ctx_type, **kw):
+    with _ctx_lock:
+        _ctx[imessage.normalize_handle(sender)] = {"type": ctx_type, **kw}
+
+
+def _ctx_get(sender):
+    with _ctx_lock:
+        return _ctx.get(imessage.normalize_handle(sender), {})
+
 # After send_reply() completes, we record current_max_rowid() here so the main
 # loop can use max(state_rowid, _post_send_rowid) as its effective watermark.
 # This prevents the bridge from re-processing its own outgoing messages when
@@ -1044,13 +1060,11 @@ def _handle_note_intent(text, sender):
     elif op == "show":
         sorted_notes = _notes_sorted(notes)
         if index is not None and 0 <= index < len(sorted_notes):
-            n = sorted_notes[index]
-            send_reply(sender, f"{n['title']}\n({_format_note_time(n['modified_at'])})\n\n{n['content']}")
+            _show_note(sender, sorted_notes[index])
         elif query:
             matches = [n for n in sorted_notes if query.lower() in n["title"].lower() or query.lower() in n["content"].lower()]
             if matches:
-                n = matches[0]
-                send_reply(sender, f"{n['title']}\n({_format_note_time(n['modified_at'])})\n\n{n['content']}")
+                _show_note(sender, matches[0])
             else:
                 send_reply(sender, f"No note found matching '{query}'.")
         else:
@@ -1120,6 +1134,86 @@ def _list_notes(sender, notes=None):
     for i, n in enumerate(sorted_notes, 1):
         lines.append(f"{i}. {n['title']} — {_format_note_time(n['modified_at'])}")
     send_reply(sender, "\n".join(lines))
+    _ctx_set(sender, "notes_list", items=sorted_notes)
+
+
+def _show_note(sender, note):
+    """Send a note's full content and set context so follow-ups work."""
+    send_reply(sender, f"{note['title']}\n({_format_note_time(note['modified_at'])})\n\n{note['content']}")
+    _ctx_set(sender, "note_open", item=note)
+
+
+def _resolve_index(text_lower):
+    """Parse a 1-based index from natural language like '1', 'first', 'the second one'."""
+    ordinals = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+                "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10}
+    for word, val in ordinals.items():
+        if word in text_lower:
+            return val - 1  # 0-based
+    m = re.search(r"\b(\d+)\b", text_lower)
+    if m:
+        return int(m.group(1)) - 1
+    return None
+
+
+def _try_context_shortcut(text, sender, state, config, blocking):
+    """Handle follow-up messages using prior context. Returns True if handled."""
+    ctx = _ctx_get(sender)
+    if not ctx:
+        return False
+    lower = text.strip().lower()
+    ctx_type = ctx.get("type")
+
+    # After showing a notes list: "open 1", "first", "the second one", "show 2", "1"
+    if ctx_type == "notes_list":
+        items = ctx.get("items", [])
+        open_pat = re.match(
+            r"^(?:open|show|read|view|get|see|check|the|that|this|ok|yes|yep|yeah|sure|go|load)?\s*"
+            r"(?:open|show|read|view|the\s+)?"
+            r"(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|\d+)"
+            r"(?:\s+one|\s+note)?\s*$",
+            lower,
+        )
+        if open_pat or re.match(r"^\d+$", lower.strip()):
+            idx = _resolve_index(lower)
+            if idx is not None and 0 <= idx < len(items):
+                _show_note(sender, items[idx])
+                return True
+
+    # After showing a single note: "delete it", "delete this", "rename it to X", "add: ...", "close"
+    if ctx_type == "note_open":
+        item = ctx.get("item", {})
+        if re.match(r"^(delete\s+(it|this|that)|remove\s+(it|this))$", lower):
+            notes = _load_notes()
+            notes = [n for n in notes if n["id"] != item["id"]]
+            _save_notes(notes)
+            send_reply(sender, f"Deleted: {item['title']}")
+            _ctx_set(sender, "notes_list")  # clear note context
+            return True
+        m = re.match(r"^rename\s+(?:it\s+)?(?:to\s+)?(.+)$", lower)
+        if m:
+            new_title = m.group(1).strip()
+            notes = _load_notes()
+            for n in notes:
+                if n["id"] == item["id"]:
+                    n["title"] = new_title
+                    n["modified_at"] = time.time()
+            _save_notes(notes)
+            send_reply(sender, f"Renamed to: {new_title}")
+            return True
+        m_append = re.match(r"^(?:add|append|also add|add to (?:it|this))[:\s]+(.+)$", lower, re.DOTALL)
+        if m_append:
+            addition = text[m_append.start(1):]
+            notes = _load_notes()
+            for n in notes:
+                if n["id"] == item["id"]:
+                    n["content"] = n["content"].rstrip() + "\n\n" + addition.strip()
+                    n["modified_at"] = time.time()
+                    _save_notes(notes)
+                    send_reply(sender, f"Added to '{item['title']}'")
+                    return True
+
+    return False
 
 
 def _build_status(config, state, sender):
@@ -1286,6 +1380,11 @@ def handle_message(config, msg, state, *, blocking=False):
     pending = state.setdefault("pending", {})
 
     if handle_command(config, text, sender, state, blocking=blocking):
+        return
+
+    # Context-aware shortcut: resolve follow-ups like "open 1" or "delete it"
+    # based on what the bridge most recently showed this sender.
+    if _try_context_shortcut(text, sender, state, config, blocking):
         return
 
     approve_key = f"{sender_norm}:approve"

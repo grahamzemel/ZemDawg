@@ -22,6 +22,7 @@ import imessage
 
 DB_PATH = Path.home() / "Library/Messages/chat.db"
 STATE_FILE = Path(__file__).with_suffix(".state.json")
+REMINDERS_FILE = Path(__file__).with_name("reminders.json")
 LOG_DIR = Path(__file__).parent / "logs"
 REPO_ROOT = Path(__file__).resolve().parent
 MIGRATE_SCRIPT = REPO_ROOT / "migrate.py"
@@ -606,7 +607,7 @@ def _do_update(sender):
     with the freshly pulled code — no manual launchctl commands needed."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "pull", "--ff-only"],
+            ["git", "-C", str(REPO_ROOT), "pull", "--ff-only", "origin", "main"],
             capture_output=True, text=True, timeout=60,
         )
         output = (result.stdout + result.stderr).strip() or "Already up to date."
@@ -651,16 +652,18 @@ def _call_claude(user_text, system_prompt, timeout=90):
 
 
 _CLASSIFY_PROMPT = (
-    "Classify the following message into exactly one of three categories. "
+    "Classify the following message into exactly one of four categories. "
     "Reply with exactly one word.\n"
     "command — the user wants to run a bridge operation: check usage/status/credits, "
     "get the current session URL, update/restart the bridge, start a new/fresh session, "
-    "stop/clear the session, or check an estimate.\n"
+    "stop/clear the session, list reminders, or cancel a reminder.\n"
+    "reminder — the user wants to be reminded of something at a future time or after a delay.\n"
     "coding — the message requires code to be written, debugged, deployed, or references "
     "a specific repo, PR, or technical implementation task.\n"
     "general — everything else: questions, ideas, planning, conversation.\n"
     "If uncertain between command and general, reply general. "
-    "If uncertain between coding and general, reply general."
+    "If uncertain between coding and general, reply general. "
+    "If the message contains a time (at 6pm, in 2 hours, tomorrow morning) AND something to remember, reply reminder."
 )
 
 _COMMAND_EXTRACT_PROMPT = (
@@ -670,7 +673,9 @@ _COMMAND_EXTRACT_PROMPT = (
     "url — get the current active session URL\n"
     "update — update and restart the bridge with latest code\n"
     "new — start a fresh Devin session\n"
-    "Reply with only the single command word. If none match, reply status."
+    "reminders — list pending reminders\n"
+    "cancel reminder — cancel a reminder\n"
+    "Reply with only the single command word (or two words for 'cancel reminder'). If none match, reply status."
 )
 
 _ANSWER_PROMPT = (
@@ -703,12 +708,16 @@ def route_message(config, text, sender, state, *, blocking=False):
 
     # Command intent — map to a bridge command and execute it.
     if classification and "command" in classification.lower():
-        cmd = _call_claude(text, _COMMAND_EXTRACT_PROMPT, timeout=20) or "status"
-        cmd = cmd.strip().lower()
+        cmd = (_call_claude(text, _COMMAND_EXTRACT_PROMPT, timeout=20) or "status").strip().lower()
         LOG.info("Claude mapped to command: %s", cmd)
         if handle_command(config, cmd, sender, state, blocking=blocking):
             return
         # handle_command returned False (unrecognised) — fall through to general.
+
+    # Reminder intent — extract time + content and schedule it.
+    if classification and "reminder" in classification.lower():
+        threading.Thread(target=_set_reminder, args=(config, text, sender), daemon=True).start()
+        return
 
     is_coding = classification is not None and "coding" in classification.lower()
 
@@ -781,6 +790,145 @@ def run_migration(command_text, sender):
             send_reply(sender, f"Migration error: {e}")
 
     threading.Thread(target=worker, daemon=True).start()
+
+
+def _load_reminders():
+    try:
+        if REMINDERS_FILE.exists():
+            return json.loads(REMINDERS_FILE.read_text())
+    except Exception:
+        pass
+    return []
+
+
+def _save_reminders(reminders):
+    try:
+        REMINDERS_FILE.write_text(json.dumps(reminders, indent=2))
+    except Exception as e:
+        LOG.error("Failed to save reminders: %s", e)
+
+
+def _check_reminders(config):
+    """Called from the main loop every poll cycle. Fire any reminders whose time has come."""
+    reminders = _load_reminders()
+    now = time.time()
+    changed = False
+    for r in reminders:
+        if r.get("fired"):
+            continue
+        if now >= r.get("fire_at", float("inf")):
+            r["fired"] = True
+            changed = True
+            sender = r.get("sender") or config.get("reply_to", "")
+            label = r.get("label", "Reminder")
+            content = r.get("content", "")
+            body = f"Reminder: {label}"
+            if content and content != label:
+                body += f"\n\n{content}"
+            LOG.info("Firing reminder for %s: %s", sender, label)
+            send_reply(sender, body)
+    if changed:
+        _save_reminders(reminders)
+
+
+def _set_reminder(config, text, sender):
+    """Use Claude to extract time + content from the message and save a reminder."""
+    from datetime import datetime
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+    extract_prompt = (
+        f"Current local time: {now_str}\n"
+        "The user wants to set a reminder. Extract the fire time, a short label, "
+        "and the full content to remind them of.\n"
+        "Reply in EXACTLY this format (no other text):\n"
+        "TIME: 2026-01-15T18:00:00\n"
+        "LABEL: Short one-line description\n"
+        "CONTENT: Full reminder text (can be long, copy everything relevant verbatim)\n\n"
+        "TIME must be an absolute ISO 8601 datetime in local time. "
+        "If the user says 'at 6pm' use today at 18:00 (or tomorrow if that time has passed). "
+        "If you cannot determine a time, use TIME: unknown"
+    )
+    raw = _call_claude(text, extract_prompt, timeout=60)
+    if not raw:
+        send_reply(sender, "Could not parse reminder. Try: remind me at 6pm to do X")
+        return
+
+    fire_at = None
+    label = "Reminder"
+    content = ""
+    for line in raw.splitlines():
+        if line.startswith("TIME:"):
+            val = line[5:].strip()
+            if val != "unknown":
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(val)
+                    fire_at = dt.timestamp()
+                except Exception:
+                    pass
+        elif line.startswith("LABEL:"):
+            label = line[6:].strip()
+        elif line.startswith("CONTENT:"):
+            content = line[8:].strip()
+
+    if fire_at is None:
+        send_reply(sender, "Could not parse a time from your message. Try: remind me at 6pm to do X")
+        return
+
+    from datetime import datetime
+    fire_dt = datetime.fromtimestamp(fire_at)
+    reminder = {
+        "id": str(int(time.time() * 1000)),
+        "sender": sender,
+        "fire_at": fire_at,
+        "label": label,
+        "content": content,
+        "fired": False,
+    }
+    reminders = _load_reminders()
+    reminders.append(reminder)
+    _save_reminders(reminders)
+    send_reply(sender, f"Reminder set for {fire_dt.strftime('%B %-d at %-I:%M %p')}: {label}")
+
+
+def _list_reminders(sender):
+    reminders = _load_reminders()
+    pending = [r for r in reminders if not r.get("fired")]
+    if not pending:
+        send_reply(sender, "No pending reminders.")
+        return
+    from datetime import datetime
+    lines = [f"{len(pending)} pending reminder(s):"]
+    for i, r in enumerate(pending, 1):
+        dt = datetime.fromtimestamp(r["fire_at"]).strftime("%b %-d at %-I:%M %p")
+        lines.append(f"{i}. {dt} — {r['label']}")
+    send_reply(sender, "\n".join(lines))
+
+
+def _cancel_reminder(text, sender):
+    reminders = _load_reminders()
+    pending = [r for r in reminders if not r.get("fired")]
+    if not pending:
+        send_reply(sender, "No pending reminders to cancel.")
+        return
+    # Try to match by number first
+    digits = re.search(r"\d+", text)
+    if digits:
+        idx = int(digits.group()) - 1
+        if 0 <= idx < len(pending):
+            cancelled = pending[idx]
+            cancelled["fired"] = True
+            _save_reminders(reminders)
+            send_reply(sender, f"Cancelled: {cancelled['label']}")
+            return
+    # Fall back: cancel by keyword match
+    keyword = re.sub(r"cancel\s+reminder\s*", "", text, flags=re.I).strip().lower()
+    for r in pending:
+        if keyword and keyword in r["label"].lower():
+            r["fired"] = True
+            _save_reminders(reminders)
+            send_reply(sender, f"Cancelled: {r['label']}")
+            return
+    send_reply(sender, "Could not find that reminder. Say 'reminders' to see the list.")
 
 
 def _build_status(config, state, sender):
@@ -865,7 +1013,7 @@ def handle_command(config, text, sender, state, *, blocking=False):
         _clear_active_session(state, sender)
         credits_ok, credits_reason = devin_usage.devin_credits_ok()
         if not credits_ok:
-            send_reply(sender, f"Devin is out of credits: {credits_reason} Session cleared. Your next message will be handled by Claude.")
+            send_reply(sender, f"Devin is unavailable: {credits_reason} Claude is ready. What do you need?")
             return True
         kickoff = (config["context"] + "\n\nNew session started. Greet the user briefly and ask what you can help with.") if config["context"] else "New session started. Greet the user briefly and ask what you can help with."
         run_session(config, kickoff, sender, state, blocking=blocking)
@@ -919,6 +1067,14 @@ def handle_command(config, text, sender, state, *, blocking=False):
 
     if lower in ("update", "deploy", "pull"):
         threading.Thread(target=_do_update, args=(sender,), daemon=True).start()
+        return True
+
+    if lower in ("reminders", "reminder", "list reminders", "my reminders"):
+        _list_reminders(sender)
+        return True
+
+    if lower.startswith("cancel reminder") or lower.startswith("cancel reminder"):
+        _cancel_reminder(t, sender)
         return True
 
     return False
@@ -1021,6 +1177,7 @@ def main():
                     _read_sent_watermark(),
                     _post_send_rowid,
                 )
+            _check_reminders(config)
             messages = get_new_messages(effective_rowid, config["allowed_normalized"])
             if messages:
                 new_last = max(m["rowid"] for m in messages)

@@ -764,7 +764,10 @@ def handle_command(config, text, sender, state, *, blocking=False):
 
     if lower in ("new", "/new", "reset", "/reset", "new session", "reset session") or lower.startswith(("new ", "/new ", "reset ", "/reset ")):
         _clear_active_session(state, sender)
-        # Start a fresh session immediately so the user gets a URL right away.
+        credits_ok, credits_reason = devin_usage.devin_credits_ok()
+        if not credits_ok:
+            send_reply(sender, f"Devin is out of credits: {credits_reason} Session cleared. Your next message will be handled by Claude.")
+            return True
         kickoff = (config["context"] + "\n\nNew session started. Greet the user briefly and ask what you can help with.") if config["context"] else "New session started. Greet the user briefly and ask what you can help with."
         run_session(config, kickoff, sender, state, blocking=blocking)
         return True

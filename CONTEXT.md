@@ -6,7 +6,7 @@ The user is messaging you from an iPhone or Mac via a Mac mini iMessage bridge.
 ## Repo handling
 - If the prompt explicitly names a repo (e.g. "work in grahamzemel/foo"), use that repo and open a PR when done.
 - If no repo is named, do NOT ask for one unless you genuinely cannot proceed without it.
-- For changes to the bridge itself (grahamzemel/mac-mini-migration), you MUST push directly to main (not open a PR). The Mac mini watches origin/main and auto-restarts when new commits land. A PR does nothing — it won't be merged automatically.
+- For changes to the bridge itself (grahamzemel/ZemDawg), you MUST push directly to main (not open a PR). The Mac mini watches origin/main and auto-restarts when new commits land. A PR does nothing — it won't be merged automatically.
 
 ## Project scaffolding
 - For prompts that start with create/build/design/make/scaffold, generate a new full-stack project.

@@ -651,10 +651,26 @@ def _call_claude(user_text, system_prompt, timeout=90):
 
 
 _CLASSIFY_PROMPT = (
-    "Classify the following message. Does it require actual code to be written, "
-    "debugged, deployed, or does it mention a specific repo, PR, or technical "
-    "implementation task? Reply with exactly one word: coding or general. "
-    "If uncertain, reply general."
+    "Classify the following message into exactly one of three categories. "
+    "Reply with exactly one word.\n"
+    "command — the user wants to run a bridge operation: check usage/status/credits, "
+    "get the current session URL, update/restart the bridge, start a new/fresh session, "
+    "stop/clear the session, or check an estimate.\n"
+    "coding — the message requires code to be written, debugged, deployed, or references "
+    "a specific repo, PR, or technical implementation task.\n"
+    "general — everything else: questions, ideas, planning, conversation.\n"
+    "If uncertain between command and general, reply general. "
+    "If uncertain between coding and general, reply general."
+)
+
+_COMMAND_EXTRACT_PROMPT = (
+    "The user wants to run a bridge command. Map their message to exactly one of these "
+    "command names and reply with only that word:\n"
+    "status — check Devin usage, credits, session counts, or quota\n"
+    "url — get the current active session URL\n"
+    "update — update and restart the bridge with latest code\n"
+    "new — start a fresh Devin session\n"
+    "Reply with only the single command word. If none match, reply status."
 )
 
 _ANSWER_PROMPT = (
@@ -684,6 +700,15 @@ def route_message(config, text, sender, state, *, blocking=False):
     # Step 1: classify with Claude.
     classification = _call_claude(text, _CLASSIFY_PROMPT, timeout=30)
     LOG.info("Claude classified message as: %s", (classification or "FAILED")[:20])
+
+    # Command intent — map to a bridge command and execute it.
+    if classification and "command" in classification.lower():
+        cmd = _call_claude(text, _COMMAND_EXTRACT_PROMPT, timeout=20) or "status"
+        cmd = cmd.strip().lower()
+        LOG.info("Claude mapped to command: %s", cmd)
+        if handle_command(config, cmd, sender, state, blocking=blocking):
+            return
+        # handle_command returned False (unrecognised) — fall through to general.
 
     is_coding = classification is not None and "coding" in classification.lower()
 

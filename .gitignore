@@ -1,0 +1,6 @@
+logs/
+bridge.state.json
+bridge.sent_watermark
+*.pyc
+__pycache__/
+.DS_Store

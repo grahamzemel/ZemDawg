@@ -730,6 +730,39 @@ _DISTILL_PROMPT = (
 )
 
 
+# Fast, conservative regexes so reminder/note intents are ALWAYS handled locally
+# by the bridge — even when a Devin coding session is active — instead of being
+# forwarded to that session as a follow-up (which is why timed reminders never
+# fired). Kept deliberately specific to avoid hijacking real coding messages.
+_TIME_TOKEN = (
+    r"(?:\bat\b|\bin\b|\btomorrow\b|\btonight\b|\btmrw\b|\btoday\b|\bnext\b"
+    r"|\d\s*(?:am|pm)|\bam\b|\bpm\b|\bmins?\b|\bminutes?\b|\bhours?\b|\bo'?clock\b)"
+)
+_REMINDER_INTENT_RE = re.compile(
+    r"(?:\bremind me\b|^\s*remind\b|\bset (?:a |an )?reminder\b|\bwake yourself\b"
+    r"|\btext me\b(?=.*" + _TIME_TOKEN + r"))",
+    re.IGNORECASE | re.DOTALL,
+)
+_NOTE_INTENT_RE = re.compile(
+    r"(?:\bmake a note\b|\btake a note\b|\bjot (?:this|that|it)?\s*down\b"
+    r"|\bwrite (?:this|that|it) down\b|\bnote (?:this|that) down\b"
+    r"|\bnote to self\b|\bsave this note\b)",
+    re.IGNORECASE,
+)
+
+
+def _detect_local_intent(text):
+    """Return 'reminder', 'note', or None for messages the bridge should handle
+    locally regardless of any active Devin session."""
+    if not text:
+        return None
+    if _REMINDER_INTENT_RE.search(text):
+        return "reminder"
+    if _NOTE_INTENT_RE.search(text):
+        return "note"
+    return None
+
+
 def route_message(config, text, sender, state, *, blocking=False):
     """Classify the message and route to Claude (general) or Devin (coding).
 
@@ -739,6 +772,16 @@ def route_message(config, text, sender, state, *, blocking=False):
     3. Coding task + Devin out of credits → Claude handles it, user is notified.
     4. If classify step fails → fall back to Devin (or Claude if Devin unavailable).
     """
+    # Step 0: cheap deterministic fast-path for obvious reminder/note intents so
+    # they work even if the Claude classify call fails or is slow.
+    fast_intent = _detect_local_intent(text)
+    if fast_intent == "reminder":
+        threading.Thread(target=_set_reminder, args=(config, text, sender), daemon=True).start()
+        return
+    if fast_intent == "note":
+        threading.Thread(target=_handle_note_intent, args=(text, sender), daemon=True).start()
+        return
+
     # Step 1: classify with Claude.
     classification = _call_claude(text, _CLASSIFY_PROMPT, timeout=30)
     LOG.info("Claude classified message as: %s", (classification or "FAILED")[:20])
@@ -1397,6 +1440,19 @@ def handle_message(config, msg, state, *, blocking=False):
     # Context-aware shortcut: resolve follow-ups like "open 1" or "delete it"
     # based on what the bridge most recently showed this sender.
     if _try_context_shortcut(text, sender, state, config, blocking):
+        return
+
+    # Reminders and notes must always be handled locally, even when a Devin
+    # coding session is active for this sender. Otherwise "remind me at 5pm ..."
+    # is forwarded to the session as a follow-up and the timed reminder never
+    # fires. Intercept the obvious cases up front (before usage guard and the
+    # active-session follow-up path).
+    local_intent = _detect_local_intent(text)
+    if local_intent == "reminder":
+        threading.Thread(target=_set_reminder, args=(config, text, sender), daemon=True).start()
+        return
+    if local_intent == "note":
+        threading.Thread(target=_handle_note_intent, args=(text, sender), daemon=True).start()
         return
 
     approve_key = f"{sender_norm}:approve"

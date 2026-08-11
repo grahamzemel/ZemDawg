@@ -35,6 +35,14 @@ CONTEXT_FILE = Path(__file__).with_name("CONTEXT.md")
 _CLAUDE_NODE = Path("/Users/gzemserver/.devin-server/bin/0d4bf12ed4a7597cb8ae9016fe8474468aad98a2/node")
 _CLAUDE_CLI = Path("/Users/gzemserver/.devin-server/extensions/anthropic.claude-code-2.1.89-universal/resources/claude-code/cli.js")
 
+# "make ..." is usually conversational ("make sure you...", "make it so I don't
+# have to..."), so those phrasings must not spin up a whole project build.
+_NOT_A_PROJECT = re.compile(
+    r"^(?:make|build|create)\s+"
+    r"(?:sure\b|it\s+(?:so|easier|stop|work|clear|more|less)\b|this\b|that\b)",
+    re.I,
+)
+
 POLL_INTERVAL = float(os.environ.get("POLL_SECONDS", "5"))
 SESSION_TIMEOUT = 7200
 # Apple's CoreData timestamp epoch offset (seconds from Unix epoch to 2001-01-01 UTC)
@@ -1370,7 +1378,7 @@ def handle_command(config, text, sender, state, *, blocking=False):
         return True
 
     # Natural-language project creation prompts go to the builder pipeline.
-    if lower.startswith(("create ", "build ", "make ", "design ", "scaffold ")):
+    if lower.startswith(("create ", "build ", "make ", "design ", "scaffold ")) and not _NOT_A_PROJECT.match(t):
         if blocking:
             builder.build(t, sender)
         else:

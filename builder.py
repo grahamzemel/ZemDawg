@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,13 @@ PROJECTS_BASE = Path(os.environ.get("PROJECTS_DIR", Path.home() / "code"))
 
 CLAUDE_TIMEOUT = 1200  # seconds
 NPM_TIMEOUT = 900
+
+# Claude Code ships its own node binary and cli.js inside the Devin server
+# extension directory. The bridge runs under launchd, which does not inherit the
+# login shell's PATH, so `claude` is usually not resolvable there.
+_DEVIN_SERVER = Path.home() / ".devin-server"
+_CLI_GLOB = "extensions/anthropic.claude-code-*/resources/claude-code/cli.js"
+_NODE_GLOB = "bin/*/node"
 
 LOG = logging.getLogger("builder")
 BUILD_LOCK = threading.Lock()
@@ -130,11 +138,42 @@ def find_backend_port(project_dir):
     return 3001
 
 
+def _newest(paths):
+    paths = [p for p in paths if p.exists()]
+    return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
+
+
+def resolve_claude_cmd():
+    """Return the argv prefix that invokes the Claude CLI, or None if unavailable.
+
+    Tries an explicit CLAUDE_CLI override, then PATH, then the node + cli.js
+    bundled with the Claude Code extension.
+    """
+    override = os.environ.get("CLAUDE_CLI")
+    if override:
+        parts = shlex.split(override)
+        if parts and Path(parts[0]).exists():
+            return parts
+
+    on_path = shutil.which("claude")
+    if on_path:
+        return [on_path]
+
+    cli = _newest(_DEVIN_SERVER.glob(_CLI_GLOB))
+    node = _newest(_DEVIN_SERVER.glob(_NODE_GLOB))
+    if cli and node:
+        return [str(node), str(cli)]
+    return None
+
+
 def run_claude(project_dir, prompt, project_name, env):
     """Run the local Claude CLI to generate a project in project_dir."""
-    claude = shutil.which("claude")
-    if not claude:
-        return False, "claude CLI not found. Install Claude Code or set PATH."
+    base_cmd = resolve_claude_cmd()
+    if not base_cmd:
+        return False, (
+            "claude CLI not found. Install Claude Code, put `claude` on the "
+            "bridge's PATH, or set CLAUDE_CLI to the cli.js path."
+        )
 
     instruction = """You are a senior full-stack developer building a project for the user.
 Build the project directly in the current directory.
@@ -157,8 +196,7 @@ REQUIREMENTS:
 - At the very end of your output, include a JSON block (wrapped in triple backticks with `json`) containing: project_name, frontend_local_url, backend_local_url, run_command, notes.
 """.format(prompt=prompt)
 
-    cmd = [
-        claude,
+    cmd = base_cmd + [
         "-p",
         instruction,
         "--dangerously-skip-permissions",

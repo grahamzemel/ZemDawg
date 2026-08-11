@@ -1,4 +1,5 @@
-"""Quick checks for the local reminder/note intent detection in bridge.py."""
+"""Quick checks for the local reminder/note intent detection and the
+conversational-vs-project routing guard in bridge.py."""
 import importlib.util
 import sys
 from pathlib import Path
@@ -36,6 +37,20 @@ CASES = [
     ("can you refactor handle_message in bridge.py", None),
 ]
 
+# True = must NOT be routed to the project builder.
+PROJECT_CASES = [
+    ("make it so I dont need to confirm stuff going forward", True),
+    ("make sure the tests pass", True),
+    ("make it easier to deploy", True),
+    ("make that change to the navbar", True),
+    ("make a parkour game", False),
+    ("make me a chrome extension", False),
+    ("build a todo app with svelte", False),
+    ("create a dashboard for my projects", False),
+    ("design a landing page", False),
+    ("scaffold a fastapi backend", False),
+]
+
 
 def main():
     failures = []
@@ -45,11 +60,18 @@ def main():
         if got != expected:
             failures.append((text, expected, got))
         print(f"{status} {text!r} -> {got}")
+    for text, expected in PROJECT_CASES:
+        got = bool(bridge._NOT_A_PROJECT.match(text))
+        status = "OK  " if got == expected else "FAIL"
+        if got != expected:
+            failures.append((text, expected, got))
+        print(f"{status} {text!r} -> not_a_project={got}")
     print()
+    total = len(CASES) + len(PROJECT_CASES)
     if failures:
         print(f"{len(failures)} failure(s)")
         return 1
-    print(f"all {len(CASES)} cases passed")
+    print(f"all {total} cases passed")
     return 0
 
 

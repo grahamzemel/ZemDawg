@@ -738,9 +738,19 @@ _TIME_TOKEN = (
     r"(?:\bat\b|\bin\b|\btomorrow\b|\btonight\b|\btmrw\b|\btoday\b|\bnext\b"
     r"|\d\s*(?:am|pm)|\bam\b|\bpm\b|\bmins?\b|\bminutes?\b|\bhours?\b|\bo'?clock\b)"
 )
+_CLOCK_TIME = r"\d{1,2}(?::\d{2})?\s*(?:am|pm)\b"
+_DAY_WORD = r"(?:tomorrow|tmrw|tonight|today|this (?:morning|afternoon|evening)|next \w+|mon|tue|wed|thu|fri|sat|sun\w*)"
 _REMINDER_INTENT_RE = re.compile(
     r"(?:\bremind me\b|^\s*remind\b|\bset (?:a |an )?reminder\b|\bwake yourself\b"
-    r"|\btext me\b(?=.*" + _TIME_TOKEN + r"))",
+    r"|\balarm\b"
+    # "Text me X at 8am" — an explicit ask to be texted at some time.
+    r"|\btext me\b(?=.*" + _TIME_TOKEN + r")"
+    # Bare time-first jottings: "11am tmrw morning alarm, dispo run",
+    # "8:30pm dinner", "at 5pm pick up keys".
+    r"|^\s*(?:at\s+)?" + _CLOCK_TIME +
+    # Day-first with a clock time: "tomorrow at 5pm trash, dishes".
+    r"|^\s*" + _DAY_WORD + r"\b(?=.*" + _CLOCK_TIME + r")"
+    r")",
     re.IGNORECASE | re.DOTALL,
 )
 _NOTE_INTENT_RE = re.compile(

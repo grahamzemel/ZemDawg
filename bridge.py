@@ -14,9 +14,11 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import builder
+import claude_cli
 import devin_usage
 import imessage
 
@@ -29,19 +31,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 MIGRATE_SCRIPT = REPO_ROOT / "migrate.py"
 CONTEXT_FILE = Path(__file__).with_name("CONTEXT.md")
 
-# Claude Pro CLI — used to handle general (non-coding) messages and to distill
-# verbose coding prompts into tight specs before sending to Devin.
-# These paths point to the node binary and cli.js bundled with Claude Code.
-_CLAUDE_NODE = Path("/Users/gzemserver/.devin-server/bin/0d4bf12ed4a7597cb8ae9016fe8474468aad98a2/node")
-_CLAUDE_CLI = Path("/Users/gzemserver/.devin-server/extensions/anthropic.claude-code-2.1.89-universal/resources/claude-code/cli.js")
-
-# "make ..." is usually conversational ("make sure you...", "make it so I don't
-# have to..."), so those phrasings must not spin up a whole project build.
-_NOT_A_PROJECT = re.compile(
-    r"^(?:make|build|create)\s+"
-    r"(?:sure\b|it\s+(?:so|easier|stop|work|clear|more|less)\b|this\b|that\b)",
-    re.I,
-)
+# Claude Pro CLI — used to handle general (non-coding) messages, to distill
+# verbose coding prompts into tight specs before sending to Devin, and to parse
+# reminder times. Located at runtime by claude_cli so a Claude Code update
+# cannot break a pinned path.
 
 POLL_INTERVAL = float(os.environ.get("POLL_SECONDS", "5"))
 SESSION_TIMEOUT = 7200
@@ -653,12 +646,13 @@ def _call_claude(user_text, system_prompt, timeout=90):
     """Run claude CLI non-interactively using the bundled node + cli.js.
     `user_text` is piped via stdin; `system_prompt` is passed as -p argument.
     Returns the stripped output string, or None on failure."""
-    if not _CLAUDE_NODE.exists() or not _CLAUDE_CLI.exists():
-        LOG.warning("Claude CLI not found at expected path — skipping")
+    argv = claude_cli.resolve()
+    if not argv:
+        LOG.warning("%s", claude_cli.unavailable_message())
         return None
     try:
         result = subprocess.run(
-            [str(_CLAUDE_NODE), str(_CLAUDE_CLI), "-p", system_prompt],
+            argv + ["-p", system_prompt],
             input=user_text,
             capture_output=True,
             text=True,
@@ -779,6 +773,29 @@ def _detect_local_intent(text):
     if _NOTE_INTENT_RE.search(text):
         return "note"
     return None
+
+
+_BUILD_PREFIX_RE = re.compile(r"^(?:create|build|make|design|scaffold)\s+(.+)", re.IGNORECASE | re.DOTALL)
+# Continuations that mean "act on something that already exists" or belong to a
+# different intent entirely, rather than "scaffold me a new project". Without
+# this, "make it so I don't have to..." and "make a note of X" were both sent
+# into the project builder.
+_NOT_BUILD_CONT_RE = re.compile(
+    r"^(?:it|this|that|these|those|them|sure|certain|yourself|your\s+|"
+    r"an?\s+(?:note|reminder|alarm)|note|reminder|alarm|"
+    # "create the PR", "build the branch" — acting on existing work.
+    r"the\s+(?:pr|pull\s+request|branch|commit|file|function|method|class|"
+    r"tests?|issue|ticket|note|reminder|repo|change|fix))\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_build_request(text):
+    """True only for messages actually asking for a new project to be scaffolded."""
+    m = _BUILD_PREFIX_RE.match(text.strip())
+    if not m:
+        return False
+    return not _NOT_BUILD_CONT_RE.match(m.group(1).strip())
 
 
 def route_message(config, text, sender, state, *, blocking=False):
@@ -934,9 +951,57 @@ def _check_reminders(config):
         _save_reminders(reminders)
 
 
+_RELATIVE_TIME_RE = re.compile(
+    r"\bin\s+(?:an?\s+|(\d+)\s*)?(mins?|minutes?|hrs?|hours?)\b", re.IGNORECASE
+)
+_CLOCK_TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", re.IGNORECASE)
+_TOMORROW_RE = re.compile(r"\b(tomorrow|tmrw|tmr)\b", re.IGNORECASE)
+
+
+def _parse_reminder_time(text, now=None):
+    """Best-effort local parse of a reminder time. Returns a POSIX timestamp or None.
+
+    Used as a fallback when the Claude CLI is unavailable, so a missing or
+    updated Claude install can't silently stop reminders from being set.
+    """
+    now = now or datetime.now()
+
+    m = _RELATIVE_TIME_RE.search(text)
+    if m:
+        amount = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(2).lower()
+        delta = timedelta(hours=amount) if unit.startswith(("hr", "hour")) else timedelta(minutes=amount)
+        return (now + delta).timestamp()
+
+    m = _CLOCK_TIME_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group(1)) % 12
+    if m.group(3).lower() == "pm":
+        hour += 12
+    target = now.replace(hour=hour, minute=int(m.group(2) or 0), second=0, microsecond=0)
+    if _TOMORROW_RE.search(text):
+        target += timedelta(days=1)
+    elif target <= now:
+        # A time that already passed today means they meant tomorrow.
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
+def _summarize_reminder(text):
+    """Derive a short label from the raw message when Claude isn't available."""
+    cleaned = re.sub(
+        r"^\s*(?:remind me(?:\s+(?:to|of|about|that))?|remind|text me|set (?:a |an )?reminder(?:\s+(?:to|for|about))?)\s*",
+        "",
+        text.strip(),
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" :,-") or "Reminder"
+    return cleaned[:80]
+
+
 def _set_reminder(config, text, sender):
     """Use Claude to extract time + content from the message and save a reminder."""
-    from datetime import datetime
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
     extract_prompt = (
         f"Current local time: {now_str}\n"
@@ -951,21 +1016,16 @@ def _set_reminder(config, text, sender):
         "If you cannot determine a time, use TIME: unknown"
     )
     raw = _call_claude(text, extract_prompt, timeout=60)
-    if not raw:
-        send_reply(sender, "Could not parse reminder. Try: remind me at 6pm to do X")
-        return
 
     fire_at = None
-    label = "Reminder"
+    label = ""
     content = ""
-    for line in raw.splitlines():
+    for line in (raw or "").splitlines():
         if line.startswith("TIME:"):
             val = line[5:].strip()
             if val != "unknown":
                 try:
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(val)
-                    fire_at = dt.timestamp()
+                    fire_at = datetime.fromisoformat(val).timestamp()
                 except Exception:
                     pass
         elif line.startswith("LABEL:"):
@@ -973,11 +1033,19 @@ def _set_reminder(config, text, sender):
         elif line.startswith("CONTENT:"):
             content = line[8:].strip()
 
+    # Claude is unavailable or produced no usable time — fall back to parsing the
+    # message directly so the reminder still gets set.
     if fire_at is None:
-        send_reply(sender, "Could not parse a time from your message. Try: remind me at 6pm to do X")
-        return
+        fire_at = _parse_reminder_time(text)
+        if fire_at is None:
+            send_reply(sender, "Could not parse a time from your message. Try: remind me at 6pm to do X")
+            return
+        LOG.info("Used fallback time parser for reminder from %s", sender)
+    if not label:
+        label = _summarize_reminder(text)
+    if not content:
+        content = text.strip()
 
-    from datetime import datetime
     fire_dt = datetime.fromtimestamp(fire_at)
     reminder = {
         "id": str(int(time.time() * 1000)),
@@ -1378,7 +1446,7 @@ def handle_command(config, text, sender, state, *, blocking=False):
         return True
 
     # Natural-language project creation prompts go to the builder pipeline.
-    if lower.startswith(("create ", "build ", "make ", "design ", "scaffold ")) and not _NOT_A_PROJECT.match(t):
+    if _looks_like_build_request(lower):
         if blocking:
             builder.build(t, sender)
         else:

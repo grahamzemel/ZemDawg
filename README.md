@@ -61,3 +61,9 @@ python3 bridge.py
 ## Logs
 
 `bridge/logs/bridge.log` and `bridge/logs/watchdog.log` are written once the plists are loaded.
+
+Tail live logs:
+
+```bash
+tail -f ~/code/zemdawg/logs/bridge.log
+```

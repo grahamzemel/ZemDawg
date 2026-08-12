@@ -53,6 +53,49 @@ STATE_LOCK = threading.Lock()
 _ctx: dict = {}
 _ctx_lock = threading.Lock()
 
+# Recent message history per sender for classification context (last 6 turns).
+_history: dict = {}
+_history_lock = threading.Lock()
+_HISTORY_MAX = 6
+
+# Dedup cache: tracks (normalized_text, approx_time) to skip the same message
+# arriving from multiple handles (phone + email) within a short window.
+_dedup_cache: dict = {}  # key: normalized_text -> last seen timestamp
+_dedup_lock = threading.Lock()
+_DEDUP_WINDOW = 10  # seconds
+
+
+def _is_duplicate(text: str) -> bool:
+    """Return True if this message text was already processed within DEDUP_WINDOW seconds."""
+    key = text.strip().lower()[:200]
+    now = time.time()
+    with _dedup_lock:
+        last = _dedup_cache.get(key)
+        if last and now - last < _DEDUP_WINDOW:
+            return True
+        _dedup_cache[key] = now
+        # Prune old entries
+        stale = [k for k, t in _dedup_cache.items() if now - t > _DEDUP_WINDOW * 10]
+        for k in stale:
+            del _dedup_cache[k]
+    return False
+
+
+def _history_add(sender, role, text):
+    with _history_lock:
+        turns = _history.setdefault(sender, [])
+        turns.append(f"{role}: {text[:300]}")
+        if len(turns) > _HISTORY_MAX:
+            turns.pop(0)
+
+
+def _history_context(sender):
+    with _history_lock:
+        turns = _history.get(sender, [])
+        if not turns:
+            return ""
+        return "Recent conversation:\n" + "\n".join(turns) + "\n\nCurrent message:"
+
 
 def _ctx_set(sender, ctx_type, **kw):
     with _ctx_lock:
@@ -318,16 +361,17 @@ def send_reply(handle, text):
     LOG.info("Sending reply to %s: %s", handle, text[:120])
     try:
         imessage.send_imessage(handle, text)
-        # Record the max rowid after our send so the main loop skips our own
-        # outgoing message (which lands in chat.db as is_from_me=1). Written
-        # to disk so restarts don't replay the bridge's own replies.
+    except Exception as e:
+        LOG.error("Failed to send reply: %s", e)
+    finally:
+        # Always update watermark regardless of send outcome — if osascript
+        # times out but Messages still sent the message, we must advance past
+        # that rowid so the bridge doesn't re-process its own reply.
         new_max = current_max_rowid()
         with _post_send_lock:
             if new_max > _post_send_rowid:
                 _post_send_rowid = new_max
         _write_sent_watermark(new_max)
-    except Exception as e:
-        LOG.error("Failed to send reply: %s", e)
 
 
 def call_devin_api(config, prompt):
@@ -818,7 +862,10 @@ def route_message(config, text, sender, state, *, blocking=False):
         return
 
     # Step 1: classify with Claude.
-    classification = _call_claude(text, _CLASSIFY_PROMPT, timeout=30)
+    _history_add(sender, "user", text)
+    ctx_prefix = _history_context(sender)
+    classify_text = f"{ctx_prefix} {text}" if ctx_prefix else text
+    classification = _call_claude(classify_text, _CLASSIFY_PROMPT, timeout=30)
     LOG.info("Claude classified message as: %s", (classification or "FAILED")[:20])
 
     # Command intent — map to a bridge command and execute it.
@@ -845,6 +892,7 @@ def route_message(config, text, sender, state, *, blocking=False):
         # General question / idea / planning — Claude handles it directly.
         answer = _call_claude(text, _ANSWER_PROMPT, timeout=60)
         if answer:
+            _history_add(sender, "assistant", answer)
             send_reply(sender, answer)
         else:
             # Claude failed — last resort: send to Devin as a general prompt.
@@ -1020,8 +1068,11 @@ def _set_reminder(config, text, sender):
     fire_at = None
     label = ""
     content = ""
+    content_started = False
     for line in (raw or "").splitlines():
-        if line.startswith("TIME:"):
+        if content_started:
+            content += "\n" + line
+        elif line.startswith("TIME:"):
             val = line[5:].strip()
             if val != "unknown":
                 try:
@@ -1032,6 +1083,7 @@ def _set_reminder(config, text, sender):
             label = line[6:].strip()
         elif line.startswith("CONTENT:"):
             content = line[8:].strip()
+            content_started = True
 
     # Claude is unavailable or produced no usable time — fall back to parsing the
     # message directly so the reminder still gets set.
@@ -1516,7 +1568,10 @@ def handle_command(config, text, sender, state, *, blocking=False):
 
 def handle_message(config, msg, state, *, blocking=False):
     text = (msg.get("text") or "").strip()
-    sender = config.get("reply_to") or msg["handle"]
+    if _is_duplicate(text):
+        LOG.debug("Skipping duplicate message from %s: %s", msg["handle"], text[:60])
+        return
+    sender = msg["handle"]
     sender_norm = imessage.normalize_handle(sender)
     pending = state.setdefault("pending", {})
 
@@ -1616,6 +1671,10 @@ def main():
             n = n[1:]
         return n
 
+    global _webhook_config
+    _webhook_config = config
+    threading.Thread(target=_start_webhook_server, args=(config,), daemon=True).start()
+
     LOG.info("Bridge online.")
 
     while True:
@@ -1647,6 +1706,266 @@ def main():
         except Exception as e:
             LOG.exception("Main loop error: %s", e)
         time.sleep(POLL_INTERVAL)
+
+
+_webhook_config = None
+
+_WEBHOOK_UI = """<!DOCTYPE html>
+<html>
+<head>
+<title>ZemDawg Webhook Tester</title>
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 500px; margin: 60px auto; padding: 0 20px; background: #0a0a0a; color: #e0e0e0; }
+  h1 { font-size: 1.4rem; margin-bottom: 8px; }
+  p { color: #888; font-size: 0.9rem; margin-bottom: 24px; }
+  input, textarea { width: 100%; padding: 10px; background: #1a1a1a; border: 1px solid #333; border-radius: 8px; color: #e0e0e0; font-size: 0.95rem; box-sizing: border-box; margin-bottom: 12px; }
+  button { width: 100%; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; }
+  button:hover { background: #1d4ed8; }
+  #result { margin-top: 16px; padding: 12px; border-radius: 8px; display: none; }
+  .ok { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+  .err { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+</style>
+</head>
+<body>
+<h1>ZemDawg Webhook Tester</h1>
+<p>Send a test iMessage alert via the bridge.</p>
+<input id="msg" placeholder="Alert message" value="Test: vault.grahamzemel.com is DOWN" />
+<button onclick="send()">Send Test Alert</button>
+<div id="result"></div>
+<script>
+async function send() {
+  const r = document.getElementById('result');
+  r.style.display = 'none';
+  try {
+    const res = await fetch('/webhook/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({msg: document.getElementById('msg').value})
+    });
+    const data = await res.json();
+    r.className = res.ok ? 'ok' : 'err';
+    r.textContent = res.ok ? 'Sent! Check your iMessages.' : 'Error: ' + (data.error || res.status);
+  } catch(e) { r.className = 'err'; r.textContent = 'Error: ' + e.message; }
+  r.style.display = 'block';
+}
+</script>
+</body>
+</html>"""
+
+
+_stocks_cache: dict = {}
+_stocks_cache_time: float = 0.0
+_STOCKS_CACHE_TTL = 60
+_STOCKS_LOCK = threading.Lock()
+_STOCK_SYMBOLS = ["NVDA", "AAPL", "SPY", "BTC-USD"]
+
+
+def _fetch_stocks() -> dict:
+    global _stocks_cache, _stocks_cache_time
+    import urllib.request as _ur
+    now = time.time()
+    with _STOCKS_LOCK:
+        if now - _stocks_cache_time < _STOCKS_CACHE_TTL and _stocks_cache:
+            return dict(_stocks_cache)
+    result = {}
+    for sym in _STOCK_SYMBOLS:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
+            req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with _ur.urlopen(req, timeout=5) as r:
+                data = json.loads(r.read())
+            meta = data["chart"]["result"][0]["meta"]
+            price = round(meta["regularMarketPrice"], 2)
+            prev = round(meta.get("chartPreviousClose") or meta.get("previousClose") or price, 2)
+            pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+            result[sym] = {
+                "price": price,
+                "prev_close": prev,
+                "change_pct": pct,
+                "change": f"+{pct:.2f}%" if pct >= 0 else f"{pct:.2f}%",
+            }
+        except Exception as exc:
+            LOG.warning("Stock fetch failed for %s: %s", sym, exc)
+            result[sym] = {"price": None, "prev_close": None, "change_pct": 0, "change": "N/A"}
+    with _STOCKS_LOCK:
+        _stocks_cache = result
+        _stocks_cache_time = time.time()
+    return result
+
+
+def _start_webhook_server(config, port=8765):
+    """Start a lightweight HTTP server for Uptime Kuma webhooks and a test UI."""
+    import http.server
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            LOG.debug("webhook: " + format, *args)
+
+        def _send(self, code, body, content_type="application/json"):
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+            self.wfile.write(body.encode() if isinstance(body, str) else body)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/" or self.path == "/webhook":
+                self._send(200, _WEBHOOK_UI, "text/html")
+            elif self.path == "/api/stats":
+                try:
+                    import psutil
+                    m = psutil.virtual_memory()
+                    d = psutil.disk_usage("/")
+                    c = psutil.cpu_percent(interval=0.1)
+                    load = psutil.getloadavg()
+                    stats = {
+                        "cpu_percent": round(c, 1),
+                        "load_avg": round(load[0], 2),
+                        "ram_used_gb": round(m.used / 1e9, 1),
+                        "ram_total_gb": round(m.total / 1e9, 1),
+                        "ram_free_gb": round(m.available / 1e9, 1),
+                        "ram_free_mb": round(m.available / 1e6, 1),
+                        "disk_used_gb": round(d.used / 1e9, 1),
+                        "disk_total_gb": round(d.total / 1e9, 1),
+                        "disk_avail_gb": round(d.free / 1e9, 1),
+                    }
+                    self._send(200, json.dumps(stats))
+                except Exception as e:
+                    self._send(500, json.dumps({"error": str(e)}))
+            elif self.path == "/api/stocks":
+                try:
+                    self._send(200, json.dumps(_fetch_stocks()))
+                except Exception as e:
+                    self._send(500, json.dumps({"error": str(e)}))
+            elif self.path.startswith("/api/kuma/"):
+                import urllib.request as _ur
+                sub = self.path[len("/api/kuma/"):]
+                try:
+                    with _ur.urlopen(f"http://localhost:3000/api/status-page/{sub}", timeout=5) as r:
+                        self._send(200, r.read(), "application/json")
+                except Exception as e:
+                    self._send(502, json.dumps({"error": str(e)}))
+            elif self.path.startswith("/api/3/"):
+                # Glances-compatible API for Homepage's glances widget
+                try:
+                    import psutil
+                    ep = self.path[len("/api/3/"):]
+                    if ep == "cpu":
+                        cpu = psutil.cpu_percent(interval=0.1)
+                        self._send(200, json.dumps({
+                            "total": cpu, "idle": round(100 - cpu, 1),
+                            "cpucore": psutil.cpu_count(), "time_since_update": 1,
+                            "user": 0, "system": 0, "nice": 0, "iowait": 0,
+                        }))
+                    elif ep == "mem":
+                        m = psutil.virtual_memory()
+                        self._send(200, json.dumps({
+                            "total": m.total, "available": m.available,
+                            "percent": m.percent, "used": m.used, "free": m.free,
+                        }))
+                    elif ep in ("mem/swap", "memswap"):
+                        s = psutil.swap_memory()
+                        self._send(200, json.dumps({
+                            "total": s.total, "used": s.used,
+                            "free": s.free, "percent": s.percent,
+                        }))
+                    elif ep == "fs":
+                        parts = []
+                        for p in psutil.disk_partitions():
+                            if p.mountpoint != "/":
+                                continue
+                            try:
+                                u = psutil.disk_usage(p.mountpoint)
+                                parts.append({
+                                    "device_name": p.device, "mnt_point": "/",
+                                    "fs_type": p.fstype, "size": u.total,
+                                    "used": u.used, "free": u.free, "percent": u.percent,
+                                })
+                            except Exception:
+                                pass
+                        self._send(200, json.dumps(parts))
+                    elif ep == "quicklook":
+                        cpu = psutil.cpu_percent(interval=0.1)
+                        m = psutil.virtual_memory()
+                        s = psutil.swap_memory()
+                        self._send(200, json.dumps({
+                            "cpu": cpu, "mem": m.percent, "swap": s.percent,
+                            "cpu_hz": 0, "cpu_hz_current": 0, "percpu": [],
+                        }))
+                    elif ep == "info":
+                        self._send(200, json.dumps({
+                            "version": "3.4.0", "psutil_version": [5, 9, 5],
+                            "python_version": "3.9", "fs_key": ["disk_name"],
+                        }))
+                    else:
+                        self._send(404, '{"error":"not found"}')
+                except Exception as e:
+                    self._send(500, json.dumps({"error": str(e)}))
+            else:
+                self._send(404, '{"error":"not found"}')
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw) if raw else {}
+            except Exception:
+                data = {}
+
+            # Test endpoint from the web UI
+            if self.path == "/webhook/test":
+                msg = data.get("msg", "Test alert from ZemDawg")
+                _send_alert(msg)
+                self._send(200, '{"ok":true}')
+                return
+
+            # Uptime Kuma webhook payload
+            if self.path == "/webhook":
+                monitor = data.get("monitor", {})
+                heartbeat = data.get("heartbeat", {})
+                name = monitor.get("name", "Unknown")
+                url = monitor.get("url", "")
+                status = heartbeat.get("status", -1)
+                status_str = "UP" if status == 1 else "DOWN"
+                emoji = "✅" if status == 1 else "🚨"
+                msg = f"{emoji} {name} is {status_str}"
+                if url:
+                    msg += f"\n{url}"
+                LOG.info("Webhook alert: %s", msg)
+                _send_alert(msg)
+                self._send(200, '{"ok":true}')
+                return
+
+            self._send(404, '{"error":"not found"}')
+
+    def _send_alert(msg):
+        if not _webhook_config:
+            return
+        reply_to = _webhook_config.get("reply_to")
+        targets = _webhook_config.get("allowed_senders", [])
+        # Prefer email handle — avoids sending as self via phone number
+        email = next((t for t in targets if "@" in t), None)
+        handle = reply_to or email or (targets[0] if targets else None)
+        if handle:
+            threading.Thread(target=send_reply, args=(handle, msg), daemon=True).start()
+
+    try:
+        http.server.HTTPServer.allow_reuse_address = True
+        server = http.server.HTTPServer(("0.0.0.0", port), Handler)
+    except OSError as exc:
+        LOG.error("Webhook server cannot bind to port %d: %s", port, exc)
+        return
+    LOG.info("Webhook server listening on port %d", port)
+    server.serve_forever()
 
 
 if __name__ == "__main__":

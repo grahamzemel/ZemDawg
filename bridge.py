@@ -258,6 +258,17 @@ def decode_attributed_body(blob: bytes) -> str:
         m = re.search(r"NSString[\x00-\x1f\x80-\xff]{1,6}([A-Za-z0-9\"'({\[!@#$%^&*_\-+=|~`<>?/.,;: ][^\x00-\x08\x0b\x0c\x0e-\x1f]{1,})", text)
         if m:
             return m.group(1).strip("\x00 ").strip()
+        # Fallback: when the structured NSString regex fails (e.g. the string
+        # is prefixed by a tapback/reaction marker or control nulls), find the
+        # longest human-readable run in the decoded blob.
+        runs = re.findall(r"[^\x00-\x1f\x7f-\x9f]{2,}", text)
+        body_runs = [r for r in runs if " " in r and not r.startswith(("NS", "kIM"))]
+        if body_runs:
+            body_runs.sort(key=len, reverse=True)
+            return body_runs[0].strip("\x00 ")
+        if runs:
+            runs.sort(key=len, reverse=True)
+            return runs[0].strip("\x00 ")
     except Exception:
         pass
     return ""
@@ -281,18 +292,19 @@ def current_max_rowid() -> int:
         return 0
 
 
-def get_new_messages(last_rowid, allowed_normalized):
-    # Two-part query:
-    # 1. is_from_me=0 → normal incoming messages from other people/phones.
-    # 2. is_from_me=1 from email addresses → messages sent from another Apple
-    #    device sharing the same Apple ID (e.g. iPhone → Mac mini via
-    #    grahamzemel126@gmail.com). Only email handles can appear this way;
-    #    phone numbers always arrive as is_from_me=0.
-    #    We keep is_from_me=0 as the default filter because reading ALL rows
-    #    (no filter) can trigger macOS authorization errors on protected messages.
-    email_handles = [h for h in allowed_normalized if "@" in h]
-    if email_handles:
-        placeholders = ",".join("?" * len(email_handles))
+def get_new_messages(last_rowid, allowed_senders, allowed_normalized):
+    # Fetch messages from allowed senders. Most are is_from_me=0 (regular
+    # incoming), but messages sent from another Apple device sharing the same
+    # Apple ID can also appear as is_from_me=1 with the user's own handle
+    # (phone or email). Include all allowed handles in the is_from_me=1 branch
+    # so those messages aren't dropped.
+    # Use the raw sender strings for the SQL IN clause because the handle.id
+    # column keeps the original form (e.g. +12035859184), while we normalize
+    # (strip +, lowercase, drop E:) for the in-memory allowlist check.
+    # We keep is_from_me=0 as the default filter because reading ALL rows
+    # (no filter) can trigger macOS authorization errors on protected messages.
+    if allowed_senders:
+        placeholders = ",".join("?" * len(allowed_senders))
         query = f"""
             SELECT m.ROWID, m.text, m.attributedBody, m.date, h.id
             FROM message m
@@ -301,7 +313,7 @@ def get_new_messages(last_rowid, allowed_normalized):
               AND (m.is_from_me = 0 OR h.id IN ({placeholders}))
             ORDER BY m.ROWID ASC
         """
-        params = [last_rowid] + email_handles
+        params = [last_rowid] + list(allowed_senders)
     else:
         query = """
             SELECT m.ROWID, m.text, m.attributedBody, m.date, h.id
@@ -1689,7 +1701,7 @@ def main():
                     _post_send_rowid,
                 )
             _check_reminders(config)
-            messages = get_new_messages(effective_rowid, config["allowed_normalized"])
+            messages = get_new_messages(effective_rowid, config["allowed_senders"], config["allowed_normalized"])
             if messages:
                 new_last = max(m["rowid"] for m in messages)
                 state["last_rowid"] = new_last
